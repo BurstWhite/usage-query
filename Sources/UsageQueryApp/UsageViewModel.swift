@@ -13,11 +13,6 @@ final class UsageViewModel: ObservableObject {
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var errorMessage: String?
 
-    @AppStorage("codexDailyTokens") private var codexDailyTokensString = ""
-    @AppStorage("codexWeeklyTokens") private var codexWeeklyTokensString = ""
-    @AppStorage("claudeDailyTokens") private var claudeDailyTokensString = ""
-    @AppStorage("claudeWeeklyTokens") private var claudeWeeklyTokensString = ""
-
     private var events: [UsageEvent] = []
     private var codexRateLimitSnapshots: [CodexRateLimitSnapshot] = []
     private let scanner = UsageScanner()
@@ -38,15 +33,6 @@ final class UsageViewModel: ObservableObject {
             return "AI Usage"
         }
         return "C \(Self.shortTokens(codex)) · A \(Self.shortTokens(claude))"
-    }
-
-    var budgets: ManualBudgets {
-        ManualBudgets(
-            codexDailyTokens: Int(codexDailyTokensString),
-            codexWeeklyTokens: Int(codexWeeklyTokensString),
-            claudeDailyTokens: Int(claudeDailyTokensString),
-            claudeWeeklyTokens: Int(claudeWeeklyTokensString)
-        )
     }
 
     func refresh() async {
@@ -75,28 +61,8 @@ final class UsageViewModel: ObservableObject {
         isRefreshing = false
     }
 
-    func updateBudget(_ value: String, for key: BudgetKey) {
-        let cleaned = value.filter(\.isNumber)
-        switch key {
-        case .codexDaily: codexDailyTokensString = cleaned
-        case .codexWeekly: codexWeeklyTokensString = cleaned
-        case .claudeDaily: claudeDailyTokensString = cleaned
-        case .claudeWeekly: claudeWeeklyTokensString = cleaned
-        }
-        summarize()
-    }
-
-    func budgetValue(for key: BudgetKey) -> String {
-        switch key {
-        case .codexDaily: codexDailyTokensString
-        case .codexWeekly: codexWeeklyTokensString
-        case .claudeDaily: claudeDailyTokensString
-        case .claudeWeekly: claudeWeeklyTokensString
-        }
-    }
-
     private func summarize() {
-        summary = UsageAggregator.summarize(events: events, codexRateLimitSnapshots: codexRateLimitSnapshots, period: selectedPeriod, budgets: budgets)
+        summary = UsageAggregator.summarize(events: events, codexRateLimitSnapshots: codexRateLimitSnapshots, period: selectedPeriod)
     }
 
     private static func cachePath() -> URL {
@@ -114,11 +80,4 @@ final class UsageViewModel: ObservableObject {
         }
         return "\(value)"
     }
-}
-
-enum BudgetKey {
-    case codexDaily
-    case codexWeekly
-    case claudeDaily
-    case claudeWeekly
 }

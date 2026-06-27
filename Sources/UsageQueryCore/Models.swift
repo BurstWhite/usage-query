@@ -18,14 +18,12 @@ public enum UsageSource: String, Codable, Sendable {
     case localUsageLog
     case localConversationEstimate
     case remoteAPI
-    case manualBudget
 
     public var displayName: String {
         switch self {
         case .localUsageLog: "Local usage log"
         case .localConversationEstimate: "Local estimate"
         case .remoteAPI: "Remote API"
-        case .manualBudget: "Manual budget"
         }
     }
 }

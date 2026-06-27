@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UsageQueryCore
 
@@ -49,14 +50,24 @@ struct UsageDashboardView: View {
 
                 Spacer()
 
-                Button {
-                    Task { await viewModel.refresh() }
-                } label: {
-                    Image(systemName: viewModel.isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await viewModel.refresh() }
+                    } label: {
+                        Image(systemName: viewModel.isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Refresh local usage")
+                    .disabled(viewModel.isRefreshing)
+
+                    Button {
+                        NSApplication.shared.terminate(nil)
+                    } label: {
+                        Image(systemName: "power")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Quit UsageQuery")
                 }
-                .buttonStyle(.bordered)
-                .help("Refresh local usage")
-                .disabled(viewModel.isRefreshing)
             }
 
             Picker("Period", selection: $viewModel.selectedPeriod) {
@@ -74,10 +85,11 @@ struct UsageDashboardView: View {
             VStack(spacing: 12) {
                 totalCard
 
-                codexRateLimitCard
-
                 ForEach(viewModel.summary.providers) { provider in
-                    ProviderCard(summary: provider)
+                    ProviderCard(
+                        summary: provider,
+                        codexLimits: provider.provider == .codex ? viewModel.summary.codexRateLimits : []
+                    )
                 }
 
                 if !viewModel.health.isEmpty {
@@ -136,7 +148,10 @@ struct UsageDashboardView: View {
         return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 if let summary {
-                    ProviderCard(summary: summary)
+                    ProviderCard(
+                        summary: summary,
+                        codexLimits: provider == .codex ? viewModel.summary.codexRateLimits : []
+                    )
                     if provider == .codex {
                         codexRateLimitCard
                     }
@@ -205,15 +220,10 @@ struct UsageDashboardView: View {
     private var settings: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Manual Token Budgets")
+                Text("Data & Privacy")
                     .font(.headline)
 
-                BudgetField(title: "Codex daily", value: binding(.codexDaily))
-                BudgetField(title: "Codex weekly", value: binding(.codexWeekly))
-                BudgetField(title: "Claude daily", value: binding(.claudeDaily))
-                BudgetField(title: "Claude weekly", value: binding(.claudeWeekly))
-
-                Text("Codex 5h and 7 days limits are inferred from local session token_count rate limits. Manual budgets only affect the older daily/weekly estimate cards. Local conversation text is read in memory for token estimation and is not stored in the cache.")
+                Text("Local conversation text is read in memory for fallback token estimation and is not stored in the cache.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -221,18 +231,11 @@ struct UsageDashboardView: View {
             .padding(14)
         }
     }
-
-    private func binding(_ key: BudgetKey) -> Binding<String> {
-        Binding {
-            viewModel.budgetValue(for: key)
-        } set: { newValue in
-            viewModel.updateBudget(newValue, for: key)
-        }
-    }
 }
 
 private struct ProviderCard: View {
     let summary: ProviderUsageSummary
+    let codexLimits: [CodexLimitSummary]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -245,23 +248,83 @@ private struct ProviderCard: View {
                     .monospacedDigit()
             }
 
-            if let quota = summary.quota, let limit = quota.limitTokens {
-                ProgressView(value: Double(min(summary.totalTokens, limit)), total: Double(max(limit, 1)))
-                HStack {
-                    Text("Remaining")
-                    Spacer()
-                    Text(UsageViewModel.shortTokens(quota.remainingTokens ?? 0))
+            if summary.provider == .codex, summary.hasUsage || hasCodexLimitSignal {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(codexLimits) { limit in
+                        CodexRemainingRow(limit: limit)
+                    }
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
             } else {
-                Text(summary.hasUsage ? "Remaining unknown" : "No local usage found")
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .padding(12)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var hasCodexLimitSignal: Bool {
+        codexLimits.contains { limit in
+            limit.remainingTokens != nil || limit.usedPercent != nil || limit.usedTokens > 0
+        }
+    }
+
+    private var statusText: String {
+        guard summary.hasUsage else {
+            return "No local usage found"
+        }
+        let authoritative = summary.authoritativeEvents
+        let estimated = summary.estimatedEvents
+        if authoritative > 0 && estimated > 0 {
+            return "\(authoritative) authoritative · \(estimated) estimated"
+        }
+        if authoritative > 0 {
+            return "\(authoritative) authoritative"
+        }
+        if estimated > 0 {
+            return "\(estimated) estimated"
+        }
+        return "Local usage found"
+    }
+}
+
+private struct CodexRemainingRow: View {
+    let limit: CodexLimitSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("\(limit.window.displayName) remaining")
+                Spacer()
+                Text(valueText)
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if let progress = limit.progress {
+                ProgressView(value: progress)
+                    .tint(limit.isNearLimit ? .orange : .accentColor)
+            }
+        }
+    }
+
+    private var valueText: String {
+        if let remainingPercent {
+            if let remaining = limit.remainingTokens {
+                return "\(remainingPercent)% · ~\(UsageViewModel.shortTokens(remaining))"
+            }
+            return "\(remainingPercent)%"
+        }
+        if let remaining = limit.remainingTokens {
+            return "~\(UsageViewModel.shortTokens(remaining))"
+        }
+        return "No rate snapshot"
+    }
+
+    private var remainingPercent: Int? {
+        limit.usedPercent.map { max(0, 100 - $0) }
     }
 }
 
@@ -296,23 +359,30 @@ private struct CodexLimitRow: View {
     }
 
     private var statusText: String {
-        if let remaining = limit.remainingTokens {
-            return "\(UsageViewModel.shortTokens(remaining)) left"
+        if let remainingPercent {
+            if let remaining = limit.remainingTokens {
+                return "\(remainingPercent)% left · ~\(UsageViewModel.shortTokens(remaining))"
+            }
+            return "\(remainingPercent)% left"
         }
-        if let usedPercent = limit.usedPercent {
-            return "\(usedPercent)% used"
+        if let remaining = limit.remainingTokens {
+            return "~\(UsageViewModel.shortTokens(remaining)) left"
         }
         return UsageViewModel.shortTokens(limit.usedTokens)
     }
 
     private var detailText: String {
         if let inferredLimit = limit.inferredLimitTokens, let usedPercent = limit.usedPercent {
-            return "\(UsageViewModel.shortTokens(limit.usedTokens)) / ~\(UsageViewModel.shortTokens(inferredLimit)) from \(usedPercent)%"
+            return "\(usedPercent)% used · \(UsageViewModel.shortTokens(limit.usedTokens)) / ~\(UsageViewModel.shortTokens(inferredLimit))"
         }
         if let usedPercent = limit.usedPercent {
             return "\(UsageViewModel.shortTokens(limit.usedTokens)) used; \(usedPercent)% from Codex"
         }
         return "\(UsageViewModel.shortTokens(limit.usedTokens)) used; no rate snapshot"
+    }
+
+    private var remainingPercent: Int? {
+        limit.usedPercent.map { max(0, 100 - $0) }
     }
 
     private var resetText: String {
@@ -342,21 +412,5 @@ private struct MetricRow: View {
                 .foregroundStyle(.secondary)
         }
         .font(.subheadline)
-    }
-}
-
-private struct BudgetField: View {
-    let title: String
-    @Binding var value: String
-
-    var body: some View {
-        HStack {
-            Text(title)
-            Spacer()
-            TextField("tokens", text: $value)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 130)
-                .multilineTextAlignment(.trailing)
-        }
     }
 }

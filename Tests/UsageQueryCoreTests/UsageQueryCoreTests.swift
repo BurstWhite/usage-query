@@ -9,7 +9,7 @@ struct UsageQueryCoreTestRunner {
         try tests.claudeParserEstimatesMissingUsageWithoutDuplicatingAuthoritativeEvents()
         try tests.codexParserReadsSessionTokenCounts()
         try tests.cacheDoesNotPersistConversationText()
-        try tests.aggregationAppliesManualBudget()
+        try tests.aggregationSummarizesProviderUsage()
         try tests.aggregationInfersCodexRollingLimits()
         try tests.aggregationIgnoresExpiredCodexRateLimitSnapshots()
         print("UsageQueryCoreTests passed")
@@ -116,7 +116,7 @@ struct UsageQueryCoreTests {
         try expect(try cache.loadEvents().count == 1, "expected cached event")
     }
 
-    func aggregationAppliesManualBudget() throws {
+    func aggregationSummarizesProviderUsage() throws {
         let now = Date(timeIntervalSince1970: 1_782_364_800)
         let events = [
             UsageEvent(
@@ -137,14 +137,12 @@ struct UsageQueryCoreTests {
         let summary = UsageAggregator.summarize(
             events: events,
             period: .today,
-            budgets: ManualBudgets(codexDailyTokens: 250),
             now: now,
             calendar: Calendar(identifier: .gregorian)
         )
 
         let codex = summary.providers.first { $0.provider == .codex }
         try expect(codex?.totalTokens == 100, "expected aggregate total")
-        try expect(codex?.quota?.remainingTokens == 150, "expected remaining budget")
         try expect(codex?.authoritativeEvents == 1, "expected authoritative count")
     }
 

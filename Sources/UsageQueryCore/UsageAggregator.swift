@@ -12,7 +12,6 @@ public struct ProviderUsageSummary: Equatable, Identifiable, Sendable {
     public let authoritativeEvents: Int
     public let estimatedEvents: Int
     public let modelBreakdown: [String: Int]
-    public let quota: QuotaSnapshot?
 
     public var hasUsage: Bool { totalTokens > 0 }
 }
@@ -61,51 +60,18 @@ public struct CodexLimitSummary: Equatable, Identifiable, Sendable {
     }
 }
 
-public struct ManualBudgets: Equatable, Sendable {
-    public var codexDailyTokens: Int?
-    public var codexWeeklyTokens: Int?
-    public var claudeDailyTokens: Int?
-    public var claudeWeeklyTokens: Int?
-
-    public init(
-        codexDailyTokens: Int? = nil,
-        codexWeeklyTokens: Int? = nil,
-        claudeDailyTokens: Int? = nil,
-        claudeWeeklyTokens: Int? = nil
-    ) {
-        self.codexDailyTokens = codexDailyTokens
-        self.codexWeeklyTokens = codexWeeklyTokens
-        self.claudeDailyTokens = claudeDailyTokens
-        self.claudeWeeklyTokens = claudeWeeklyTokens
-    }
-
-    public func limit(for provider: UsageProviderKind, period: UsagePeriod) -> (QuotaPeriod, Int?) {
-        switch (provider, period) {
-        case (.codex, .today):
-            return (.day, codexDailyTokens)
-        case (.codex, .sevenDays), (.codex, .thirtyDays):
-            return (.week, codexWeeklyTokens)
-        case (.claude, .today):
-            return (.day, claudeDailyTokens)
-        case (.claude, .sevenDays), (.claude, .thirtyDays):
-            return (.week, claudeWeeklyTokens)
-        }
-    }
-}
-
 public enum UsageAggregator {
     public static func summarize(
         events: [UsageEvent],
         codexRateLimitSnapshots: [CodexRateLimitSnapshot] = [],
         period: UsagePeriod,
-        budgets: ManualBudgets = ManualBudgets(),
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> UsageDashboardSummary {
         let start = period.startDate(now: now, calendar: calendar)
         let periodEvents = events.filter { $0.timestamp >= start && $0.timestamp <= now }
         let providers = UsageProviderKind.allCases.map { provider in
-            summary(for: provider, events: periodEvents.filter { $0.provider == provider }, period: period, budgets: budgets, now: now)
+            summary(for: provider, events: periodEvents.filter { $0.provider == provider })
         }
         let codexRateLimits = codexLimitSummaries(events: events, snapshots: codexRateLimitSnapshots, now: now)
         return UsageDashboardSummary(period: period, generatedAt: now, providers: providers, codexRateLimits: codexRateLimits)
@@ -167,10 +133,7 @@ public enum UsageAggregator {
 
     private static func summary(
         for provider: UsageProviderKind,
-        events: [UsageEvent],
-        period: UsagePeriod,
-        budgets: ManualBudgets,
-        now: Date
+        events: [UsageEvent]
     ) -> ProviderUsageSummary {
         let total = events.reduce(0) { $0 + $1.totalTokens }
         let input = events.reduce(0) { $0 + $1.inputTokens }
@@ -184,21 +147,6 @@ public enum UsageAggregator {
             .sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }
             .reduce(into: [String: Int]()) { partial, item in partial[item.key] = item.value }
 
-        let (quotaPeriod, limit) = budgets.limit(for: provider, period: period)
-        let quota = limit.map { tokenLimit in
-            QuotaSnapshot(
-                provider: provider,
-                period: quotaPeriod,
-                usedTokens: total,
-                limitTokens: tokenLimit,
-                remainingTokens: max(0, tokenLimit - total),
-                resetAt: nil,
-                source: .manualBudget,
-                freshness: now,
-                isAuthoritative: false
-            )
-        }
-
         return ProviderUsageSummary(
             provider: provider,
             totalTokens: total,
@@ -208,8 +156,7 @@ public enum UsageAggregator {
             cacheWriteTokens: cacheWrite,
             authoritativeEvents: authoritative,
             estimatedEvents: estimated,
-            modelBreakdown: modelBreakdown,
-            quota: quota
+            modelBreakdown: modelBreakdown
         )
     }
 }

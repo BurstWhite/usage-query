@@ -44,7 +44,7 @@ public struct CodexUsageProvider: UsageProvider {
         var seen = Set<String>()
 
         for file in sessionFiles() {
-            guard let reader = CodexLineReader(url: file) else {
+            guard let reader = LineReader(url: file) else {
                 continue
             }
             let fileSessionId = sessionId(fromFile: file)
@@ -79,7 +79,7 @@ public struct CodexUsageProvider: UsageProvider {
         var snapshots: [CodexRateLimitSnapshot] = []
 
         for file in sessionFiles() {
-            guard let reader = CodexLineReader(url: file) else {
+            guard let reader = LineReader(url: file) else {
                 continue
             }
             for line in reader {
@@ -223,47 +223,4 @@ public struct CodexUsageProvider: UsageProvider {
         }
     }
 
-}
-
-private final class CodexLineReader: Sequence, IteratorProtocol {
-    private let handle: FileHandle
-    private let delimiter = Data([0x0A])
-    private var buffer = Data()
-    private var isAtEOF = false
-
-    init?(url: URL) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        self.handle = handle
-    }
-
-    deinit {
-        try? handle.close()
-    }
-
-    func next() -> String? {
-        while true {
-            if let range = buffer.range(of: delimiter) {
-                let line = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
-                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
-                return String(data: line, encoding: .utf8)
-            }
-
-            if isAtEOF {
-                if buffer.isEmpty {
-                    return nil
-                }
-                let line = buffer
-                buffer.removeAll()
-                return String(data: line, encoding: .utf8)
-            }
-
-            if let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
-                buffer.append(chunk)
-            } else {
-                isAtEOF = true
-            }
-        }
-    }
 }

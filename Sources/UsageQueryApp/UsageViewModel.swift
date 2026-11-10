@@ -23,6 +23,9 @@ final class UsageViewModel: ObservableObject {
         if let cached = try? cache?.loadEvents() {
             self.events = cached
         }
+        if let cachedSnapshots = try? cache?.loadRateLimitSnapshots() {
+            self.codexRateLimitSnapshots = cachedSnapshots
+        }
         summarize()
     }
 
@@ -48,12 +51,18 @@ final class UsageViewModel: ObservableObject {
             scanner.scanLocal(since: since)
         }.value
 
-        events = result.events
-        codexRateLimitSnapshots = result.codexRateLimitSnapshots
+        // A provider whose scan threw keeps its previous data instead of being wiped.
+        let failed = result.failedProviders
+        events = result.events + events.filter { failed.contains($0.provider) }
+        events.sort { $0.timestamp < $1.timestamp }
+        codexRateLimitSnapshots = failed.contains(.codex)
+            ? codexRateLimitSnapshots
+            : result.codexRateLimitSnapshots
         health = result.health
         lastRefresh = Date()
         do {
-            try cache?.replaceEvents(result.events)
+            try cache?.replaceEvents(events)
+            try cache?.replaceRateLimitSnapshots(codexRateLimitSnapshots)
         } catch {
             errorMessage = "Cache write failed: \(error.localizedDescription)"
         }

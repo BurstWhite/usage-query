@@ -7,6 +7,8 @@ struct UsageQueryCoreTestRunner {
         let tests = UsageQueryCoreTests()
         try tests.claudeParserUsesAuthoritativeUsageWhenPresent()
         try tests.claudeParserEstimatesMissingUsageWithoutDuplicatingAuthoritativeEvents()
+        try tests.claudeParserMergesStreamedDuplicatesAndSurvivesInvalidUTF8()
+        try tests.cachePersistsRateLimitSnapshots()
         try tests.codexParserReadsSessionTokenCounts()
         try tests.cacheDoesNotPersistConversationText()
         try tests.aggregationSummarizesProviderUsage()
@@ -53,10 +55,45 @@ struct UsageQueryCoreTests {
 
         let events = try ClaudeUsageProvider(homeDirectory: home).scanLocal(since: nil)
 
-        try expect(events.count == 2, "expected two Claude events")
-        try expect(events.filter { $0.confidence == .estimated }.count == 1, "expected one estimated event")
-        try expect(events.filter { $0.confidence == .authoritative }.count == 1, "expected one authoritative event")
-        try expect((events.first { $0.confidence == .estimated }?.inputTokens ?? 0) > 0, "expected estimated input tokens")
+        try expect(events.count == 1, "estimates must not double count files that carry usage")
+        try expect(events.first?.confidence == .authoritative, "expected authoritative event only")
+
+        let estimateOnly = try temporaryHome()
+        let dir = estimateOnly.appendingPathComponent(".claude/projects/test")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try lines.components(separatedBy: "\n")[0].write(to: dir.appendingPathComponent("s.jsonl"), atomically: true, encoding: .utf8)
+        let estimated = try ClaudeUsageProvider(homeDirectory: estimateOnly).scanLocal(since: nil)
+        try expect(estimated.count == 1 && estimated[0].confidence == .estimated, "expected estimate fallback without usage")
+        try expect(estimated[0].inputTokens > 0, "expected estimated input tokens")
+    }
+
+    func claudeParserMergesStreamedDuplicatesAndSurvivesInvalidUTF8() throws {
+        let home = try temporaryHome()
+        let project = home.appendingPathComponent(".claude/projects/test")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        func line(_ output: Int, _ minute: Int) -> String {
+            #"{"type":"assistant","timestamp":"2026-06-25T02:0\#(minute):00.000Z","sessionId":"s1","uuid":"u\#(minute)","message":{"id":"m1","role":"assistant","model":"c","content":[],"usage":{"input_tokens":10,"output_tokens":\#(output)}}}"#
+        }
+        var data = Data((line(2, 0) + "\n").utf8)
+        data.append(contentsOf: [0xFF, 0xFE, 0x0A])
+        data.append(Data((line(9, 1) + "\n" + #"{"type":"assistant","timestamp":"2026-06-25T02:05:00.000Z","message":{"id":"m2","usage":{"input_tokens":1,"output_tokens":1}}}"#).utf8))
+        try data.write(to: project.appendingPathComponent("s.jsonl"))
+
+        let events = try ClaudeUsageProvider(homeDirectory: home).scanLocal(since: nil)
+        try expect(events.count == 2, "expected streamed duplicates merged and later lines still read")
+        try expect(events.first { $0.requestId == "m1" }?.outputTokens == 9, "expected the most complete duplicate to win")
+    }
+
+    func cachePersistsRateLimitSnapshots() throws {
+        let home = try temporaryHome()
+        let cache = try UsageCache(path: home.appendingPathComponent("c.sqlite").path)
+        let snapshot = CodexRateLimitSnapshot(
+            window: .fiveHours, observedAt: Date(timeIntervalSince1970: 1_000), usedPercent: 40,
+            resetAt: Date(timeIntervalSince1970: 5_000), resetAfterSeconds: 4_000,
+            allowed: true, limitReached: false, planType: "plus"
+        )
+        try cache.replaceRateLimitSnapshots([snapshot])
+        try expect(try cache.loadRateLimitSnapshots() == [snapshot], "expected snapshot round trip")
     }
 
     func codexParserReadsSessionTokenCounts() throws {

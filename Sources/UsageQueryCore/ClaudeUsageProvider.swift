@@ -11,31 +11,46 @@ public struct ClaudeUsageProvider: UsageProvider {
     }
 
     public func scanLocal(since: Date?) throws -> [UsageEvent] {
-        let files = jsonlFiles()
-        var events: [UsageEvent] = []
-        var seen = Set<String>()
+        var merged: [String: UsageEvent] = [:]
+        var order: [String] = []
 
-        for file in files {
+        for file in jsonlFiles() {
             guard let reader = LineReader(url: file) else {
                 continue
             }
+            var authoritative: [UsageEvent] = []
+            var estimated: [UsageEvent] = []
             for line in reader {
                 guard let object = JSONUtilities.object(from: line),
-                      let timestamp = JSONUtilities.isoDate(object["timestamp"]) ?? timestampFromUUIDFallback(object),
+                      let timestamp = JSONUtilities.isoDate(object["timestamp"]),
                       since.map({ timestamp >= $0 }) ?? true,
                       let event = event(from: object, timestamp: timestamp)
                 else {
                     continue
                 }
-                guard !seen.contains(event.dedupeKey) else {
-                    continue
+                if event.confidence == .authoritative {
+                    authoritative.append(event)
+                } else {
+                    estimated.append(event)
                 }
-                seen.insert(event.dedupeKey)
-                events.append(event)
+            }
+            // Estimates would double count text already billed in authoritative usage,
+            // so only fall back to them for files without any usage fields.
+            for event in authoritative.isEmpty ? estimated : authoritative {
+                let key = event.dedupeKey
+                if let existing = merged[key] {
+                    // Streamed duplicates: keep the most complete (largest) usage.
+                    if event.totalTokens >= existing.totalTokens {
+                        merged[key] = event
+                    }
+                } else {
+                    merged[key] = event
+                    order.append(key)
+                }
             }
         }
 
-        return events
+        return order.compactMap { merged[$0] }
     }
 
     public func estimateFromConversation(_ record: ConversationRecord) -> UsageEvent? {
@@ -164,55 +179,5 @@ public struct ClaudeUsageProvider: UsageProvider {
             return dictionary.values.map(extractText).joined(separator: "\n")
         }
         return ""
-    }
-
-    private func timestampFromUUIDFallback(_ object: [String: Any]) -> Date? {
-        guard JSONUtilities.stringValue(object["uuid"]) != nil else {
-            return nil
-        }
-        return nil
-    }
-}
-
-private final class LineReader: Sequence, IteratorProtocol {
-    private let handle: FileHandle
-    private let delimiter = Data([0x0A])
-    private var buffer = Data()
-    private var isAtEOF = false
-
-    init?(url: URL) {
-        guard let handle = try? FileHandle(forReadingFrom: url) else {
-            return nil
-        }
-        self.handle = handle
-    }
-
-    deinit {
-        try? handle.close()
-    }
-
-    func next() -> String? {
-        while true {
-            if let range = buffer.range(of: delimiter) {
-                let line = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
-                buffer.removeSubrange(buffer.startIndex..<range.upperBound)
-                return String(data: line, encoding: .utf8)
-            }
-
-            if isAtEOF {
-                if buffer.isEmpty {
-                    return nil
-                }
-                let line = buffer
-                buffer.removeAll()
-                return String(data: line, encoding: .utf8)
-            }
-
-            if let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
-                buffer.append(chunk)
-            } else {
-                isAtEOF = true
-            }
-        }
     }
 }

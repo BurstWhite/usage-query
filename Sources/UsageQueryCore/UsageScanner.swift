@@ -4,8 +4,16 @@ public struct UsageScanResult: Sendable {
     public let events: [UsageEvent]
     public let codexRateLimitSnapshots: [CodexRateLimitSnapshot]
     public let health: [ProviderHealth]
+    /// Providers whose scan threw; their previous data should be kept rather than wiped.
+    public let failedProviders: Set<UsageProviderKind>
 
-    public init(events: [UsageEvent], codexRateLimitSnapshots: [CodexRateLimitSnapshot], health: [ProviderHealth]) {
+    public init(
+        events: [UsageEvent],
+        codexRateLimitSnapshots: [CodexRateLimitSnapshot],
+        health: [ProviderHealth],
+        failedProviders: Set<UsageProviderKind> = []
+    ) {
+        self.failedProviders = failedProviders
         self.events = events
         self.codexRateLimitSnapshots = codexRateLimitSnapshots
         self.health = health
@@ -23,6 +31,7 @@ public struct UsageScanner: Sendable {
         var events: [UsageEvent] = []
         var codexRateLimitSnapshots: [CodexRateLimitSnapshot] = []
         var health: [ProviderHealth] = []
+        var failedProviders = Set<UsageProviderKind>()
 
         for provider in providers {
             do {
@@ -39,6 +48,7 @@ public struct UsageScanner: Sendable {
                     )
                 )
             } catch {
+                failedProviders.insert(provider.kind)
                 health.append(ProviderHealth(provider: provider.kind, isAvailable: false, message: String(describing: error)))
             }
         }
@@ -46,7 +56,8 @@ public struct UsageScanner: Sendable {
         return UsageScanResult(
             events: events.sorted { $0.timestamp < $1.timestamp },
             codexRateLimitSnapshots: codexRateLimitSnapshots.sorted { $0.observedAt < $1.observedAt },
-            health: health
+            health: health,
+            failedProviders: failedProviders
         )
     }
 }

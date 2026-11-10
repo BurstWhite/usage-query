@@ -67,7 +67,79 @@ public final class UsageCache: @unchecked Sendable {
         }
     }
 
+    public func replaceRateLimitSnapshots(_ snapshots: [CodexRateLimitSnapshot]) throws {
+        try database.execute("BEGIN TRANSACTION")
+        do {
+            try database.execute("DELETE FROM codex_rate_limit_snapshots")
+            for snapshot in snapshots {
+                try database.update(
+                    """
+                    INSERT OR REPLACE INTO codex_rate_limit_snapshots (
+                        snapshot_id, window, observed_at, used_percent, reset_at,
+                        reset_after_seconds, allowed, limit_reached, plan_type
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    bindings: [
+                        .text(snapshot.id),
+                        .text(snapshot.window.rawValue),
+                        .double(snapshot.observedAt.timeIntervalSince1970),
+                        .int(snapshot.usedPercent),
+                        snapshot.resetAt.map { SQLiteBinding.double($0.timeIntervalSince1970) } ?? .null,
+                        snapshot.resetAfterSeconds.map(SQLiteBinding.int) ?? .null,
+                        .int(snapshot.allowed ? 1 : 0),
+                        .int(snapshot.limitReached ? 1 : 0),
+                        snapshot.planType.map(SQLiteBinding.text) ?? .null
+                    ]
+                )
+            }
+            try database.execute("COMMIT")
+        } catch {
+            try? database.execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    public func loadRateLimitSnapshots() throws -> [CodexRateLimitSnapshot] {
+        try database.query(
+            """
+            SELECT window, observed_at, used_percent, reset_at, reset_after_seconds,
+                   allowed, limit_reached, plan_type
+            FROM codex_rate_limit_snapshots ORDER BY observed_at ASC
+            """
+        ).compactMap { row in
+            guard let windowRaw = row["window"]?.stringValue,
+                  let window = CodexRateLimitWindow(rawValue: windowRaw),
+                  let observedAt = row["observed_at"]?.doubleValue
+            else {
+                return nil
+            }
+            return CodexRateLimitSnapshot(
+                window: window,
+                observedAt: Date(timeIntervalSince1970: observedAt),
+                usedPercent: row["used_percent"]?.intValue ?? 0,
+                resetAt: row["reset_at"]?.doubleValue.map { Date(timeIntervalSince1970: $0) },
+                resetAfterSeconds: row["reset_after_seconds"]?.intValue,
+                allowed: (row["allowed"]?.intValue ?? 1) != 0,
+                limitReached: (row["limit_reached"]?.intValue ?? 0) != 0,
+                planType: row["plan_type"]?.stringValue
+            )
+        }
+    }
+
     private func migrate() throws {
+        try database.execute("""
+        CREATE TABLE IF NOT EXISTS codex_rate_limit_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            window TEXT NOT NULL,
+            observed_at REAL NOT NULL,
+            used_percent INTEGER NOT NULL,
+            reset_at REAL,
+            reset_after_seconds INTEGER,
+            allowed INTEGER NOT NULL,
+            limit_reached INTEGER NOT NULL,
+            plan_type TEXT
+        )
+        """)
         try database.execute("""
         CREATE TABLE IF NOT EXISTS usage_events (
             dedupe_key TEXT PRIMARY KEY,

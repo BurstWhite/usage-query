@@ -115,13 +115,22 @@ public struct UsageEvent: Codable, Equatable, Identifiable, Sendable {
     }
 
     public var dedupeKey: String {
-        let explicitId = requestId ?? sessionId ?? "\(Int(timestamp.timeIntervalSince1970))"
+        // Claude logs the same message.id on several lines (one per content block)
+        // whose token counts may differ while streaming, so identity is id-only.
+        if provider == .claude, let requestId {
+            return [provider.rawValue, source.rawValue, requestId].joined(separator: "|")
+        }
+        let explicitId = requestId
+            ?? sessionId.map { "\($0)@\(Int(timestamp.timeIntervalSince1970 * 1000))" }
+            ?? "\(Int(timestamp.timeIntervalSince1970 * 1000))"
         return [
             provider.rawValue,
             source.rawValue,
             explicitId,
             model ?? "unknown",
             "\(inputTokens)",
+            "\(cacheReadTokens)",
+            "\(cacheWriteTokens)",
             "\(outputTokens)",
             "\(totalTokens)"
         ].joined(separator: "|")

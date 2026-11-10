@@ -75,12 +75,13 @@ public final class UsageCache: @unchecked Sendable {
                 try database.update(
                     """
                     INSERT OR REPLACE INTO codex_rate_limit_snapshots (
-                        snapshot_id, window, observed_at, used_percent, reset_at,
+                        snapshot_id, provider, window, observed_at, used_percent, reset_at,
                         reset_after_seconds, allowed, limit_reached, plan_type
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     bindings: [
                         .text(snapshot.id),
+                        .text(snapshot.provider.rawValue),
                         .text(snapshot.window.rawValue),
                         .double(snapshot.observedAt.timeIntervalSince1970),
                         .int(snapshot.usedPercent),
@@ -102,7 +103,7 @@ public final class UsageCache: @unchecked Sendable {
     public func loadRateLimitSnapshots() throws -> [CodexRateLimitSnapshot] {
         try database.query(
             """
-            SELECT window, observed_at, used_percent, reset_at, reset_after_seconds,
+            SELECT provider, window, observed_at, used_percent, reset_at, reset_after_seconds,
                    allowed, limit_reached, plan_type
             FROM codex_rate_limit_snapshots ORDER BY observed_at ASC
             """
@@ -114,6 +115,7 @@ public final class UsageCache: @unchecked Sendable {
                 return nil
             }
             return CodexRateLimitSnapshot(
+                provider: row["provider"]?.stringValue.flatMap(UsageProviderKind.init(rawValue:)) ?? .codex,
                 window: window,
                 observedAt: Date(timeIntervalSince1970: observedAt),
                 usedPercent: row["used_percent"]?.intValue ?? 0,
@@ -140,6 +142,12 @@ public final class UsageCache: @unchecked Sendable {
             plan_type TEXT
         )
         """)
+        // Caches written before Claude snapshots existed have no provider column.
+        let snapshotColumns = try database.query("PRAGMA table_info(codex_rate_limit_snapshots)")
+            .compactMap { $0["name"]?.stringValue }
+        if !snapshotColumns.contains("provider") {
+            try database.execute("ALTER TABLE codex_rate_limit_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'")
+        }
         try database.execute("""
         CREATE TABLE IF NOT EXISTS usage_events (
             dedupe_key TEXT PRIMARY KEY,

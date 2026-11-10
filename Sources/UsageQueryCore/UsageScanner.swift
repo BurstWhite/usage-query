@@ -2,20 +2,20 @@ import Foundation
 
 public struct UsageScanResult: Sendable {
     public let events: [UsageEvent]
-    public let codexRateLimitSnapshots: [CodexRateLimitSnapshot]
+    public let rateLimitSnapshots: [CodexRateLimitSnapshot]
     public let health: [ProviderHealth]
     /// Providers whose scan threw; their previous data should be kept rather than wiped.
     public let failedProviders: Set<UsageProviderKind>
 
     public init(
         events: [UsageEvent],
-        codexRateLimitSnapshots: [CodexRateLimitSnapshot],
+        rateLimitSnapshots: [CodexRateLimitSnapshot],
         health: [ProviderHealth],
         failedProviders: Set<UsageProviderKind> = []
     ) {
         self.failedProviders = failedProviders
         self.events = events
-        self.codexRateLimitSnapshots = codexRateLimitSnapshots
+        self.rateLimitSnapshots = rateLimitSnapshots
         self.health = health
     }
 }
@@ -29,7 +29,7 @@ public struct UsageScanner: Sendable {
 
     public func scanLocal(since: Date?) -> UsageScanResult {
         var events: [UsageEvent] = []
-        var codexRateLimitSnapshots: [CodexRateLimitSnapshot] = []
+        var rateLimitSnapshots: [CodexRateLimitSnapshot] = []
         var health: [ProviderHealth] = []
         var failedProviders = Set<UsageProviderKind>()
 
@@ -38,7 +38,7 @@ public struct UsageScanner: Sendable {
                 let providerEvents = try provider.scanLocal(since: since)
                 let providerRateLimits = try provider.scanRateLimitSnapshots(since: since)
                 events.append(contentsOf: providerEvents)
-                codexRateLimitSnapshots.append(contentsOf: providerRateLimits)
+                rateLimitSnapshots.append(contentsOf: providerRateLimits)
                 let baseHealth = provider.healthCheck()
                 health.append(
                     ProviderHealth(
@@ -55,7 +55,7 @@ public struct UsageScanner: Sendable {
 
         return UsageScanResult(
             events: events.sorted { $0.timestamp < $1.timestamp },
-            codexRateLimitSnapshots: codexRateLimitSnapshots.sorted { $0.observedAt < $1.observedAt },
+            rateLimitSnapshots: rateLimitSnapshots.sorted { $0.observedAt < $1.observedAt },
             health: health,
             failedProviders: failedProviders
         )

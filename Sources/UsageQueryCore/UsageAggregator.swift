@@ -21,6 +21,28 @@ public struct UsageDashboardSummary: Equatable, Sendable {
     public let generatedAt: Date
     public let providers: [ProviderUsageSummary]
     public let codexRateLimits: [CodexLimitSummary]
+    public let claudeRateLimits: [CodexLimitSummary]
+
+    public init(
+        period: UsagePeriod,
+        generatedAt: Date,
+        providers: [ProviderUsageSummary],
+        codexRateLimits: [CodexLimitSummary],
+        claudeRateLimits: [CodexLimitSummary] = []
+    ) {
+        self.period = period
+        self.generatedAt = generatedAt
+        self.providers = providers
+        self.codexRateLimits = codexRateLimits
+        self.claudeRateLimits = claudeRateLimits
+    }
+
+    public func rateLimits(for provider: UsageProviderKind) -> [CodexLimitSummary] {
+        switch provider {
+        case .codex: codexRateLimits
+        case .claude: claudeRateLimits
+        }
+    }
 
     public var totalTokens: Int {
         providers.reduce(0) { $0 + $1.totalTokens }
@@ -42,14 +64,25 @@ public struct CodexLimitSummary: Equatable, Identifiable, Sendable {
     public let resetAt: Date?
     public let limitReached: Bool
 
+    /// Used share of the window. The reported percentage is account-wide and is
+    /// the floor; local usage against the inferred limit can only raise it, to
+    /// cover tokens spent here since the snapshot.
     public var progress: Double? {
-        if let inferredLimitTokens, inferredLimitTokens > 0 {
-            return min(1.0, Double(usedTokens) / Double(inferredLimitTokens))
+        let reported = usedPercent.map { min(1.0, Double(max(0, $0)) / 100.0) }
+        guard let inferredLimitTokens, inferredLimitTokens > 0 else {
+            return reported
         }
-        guard let usedPercent else {
-            return nil
-        }
-        return min(1.0, Double(max(0, usedPercent)) / 100.0)
+        let local = min(1.0, Double(usedTokens) / Double(inferredLimitTokens))
+        return max(local, reported ?? 0)
+    }
+
+    /// Share of the window still available; never more than the provider reported.
+    public var remainingPercent: Int? {
+        progress.map { max(0, min(100, Int(((1.0 - $0) * 100).rounded()))) }
+    }
+
+    public var hasSignal: Bool {
+        usedPercent != nil || usedTokens > 0
     }
 
     public var isNearLimit: Bool {
@@ -63,7 +96,7 @@ public struct CodexLimitSummary: Equatable, Identifiable, Sendable {
 public enum UsageAggregator {
     public static func summarize(
         events: [UsageEvent],
-        codexRateLimitSnapshots: [CodexRateLimitSnapshot] = [],
+        rateLimitSnapshots: [CodexRateLimitSnapshot] = [],
         period: UsagePeriod,
         now: Date = Date(),
         calendar: Calendar = .current
@@ -73,8 +106,13 @@ public enum UsageAggregator {
         let providers = UsageProviderKind.allCases.map { provider in
             summary(for: provider, events: periodEvents.filter { $0.provider == provider })
         }
-        let codexRateLimits = codexLimitSummaries(events: events, snapshots: codexRateLimitSnapshots, now: now)
-        return UsageDashboardSummary(period: period, generatedAt: now, providers: providers, codexRateLimits: codexRateLimits)
+        return UsageDashboardSummary(
+            period: period,
+            generatedAt: now,
+            providers: providers,
+            codexRateLimits: limitSummaries(provider: .codex, events: events, snapshots: rateLimitSnapshots, now: now),
+            claudeRateLimits: limitSummaries(provider: .claude, events: events, snapshots: rateLimitSnapshots, now: now)
+        )
     }
 
     public static func codexLimitSummaries(
@@ -82,27 +120,46 @@ public enum UsageAggregator {
         snapshots: [CodexRateLimitSnapshot] = [],
         now: Date = Date()
     ) -> [CodexLimitSummary] {
-        CodexRateLimitWindow.allCases.map { window in
+        limitSummaries(provider: .codex, events: events, snapshots: snapshots, now: now)
+    }
+
+    public static func limitSummaries(
+        provider: UsageProviderKind,
+        events: [UsageEvent],
+        snapshots: [CodexRateLimitSnapshot] = [],
+        now: Date = Date()
+    ) -> [CodexLimitSummary] {
+        let providerEvents = events.filter { $0.provider == provider }
+        func meteredTokens(from start: Date, to end: Date) -> Int {
+            providerEvents
+                .filter { $0.timestamp >= start && $0.timestamp <= end }
+                .reduce(0) { $0 + rateLimitTokens(for: $1) }
+        }
+
+        return CodexRateLimitWindow.allCases.map { window in
             let latestSnapshot = snapshots
                 .filter { snapshot in
-                    snapshot.window == window
+                    snapshot.provider == provider
+                        && snapshot.window == window
                         && snapshot.observedAt <= now
                         && (snapshot.resetAt.map { $0 > now } ?? true)
                 }
                 .max { $0.observedAt < $1.observedAt }
-            let currentWindowStart = now.addingTimeInterval(-window.duration)
-            let currentUsed = events
-                .filter { $0.provider == .codex && $0.timestamp >= currentWindowStart && $0.timestamp <= now }
-                .reduce(0) { $0 + codexRateLimitTokens(for: $1) }
+
+            // Claude windows are fixed blocks ending at the reported reset, so
+            // anchor on it when known. Codex stays on the rolling window.
+            let anchoredStart: Date? = provider == .claude
+                ? latestSnapshot?.resetAt.map { $0.addingTimeInterval(-window.duration) }
+                : nil
+            let currentWindowStart = anchoredStart ?? now.addingTimeInterval(-window.duration)
+            let currentUsed = meteredTokens(from: currentWindowStart, to: now)
 
             let inferredLimit = latestSnapshot.flatMap { snapshot -> Int? in
                 guard snapshot.usedPercent > 0 else {
                     return nil
                 }
-                let observedWindowStart = snapshot.observedAt.addingTimeInterval(-window.duration)
-                let observedUsed = events
-                    .filter { $0.provider == .codex && $0.timestamp >= observedWindowStart && $0.timestamp <= snapshot.observedAt }
-                    .reduce(0) { $0 + codexRateLimitTokens(for: $1) }
+                let observedWindowStart = anchoredStart ?? snapshot.observedAt.addingTimeInterval(-window.duration)
+                let observedUsed = meteredTokens(from: observedWindowStart, to: snapshot.observedAt)
                 guard observedUsed > 0 else {
                     return nil
                 }
@@ -110,7 +167,7 @@ public enum UsageAggregator {
             }
 
             return CodexLimitSummary(
-                provider: .codex,
+                provider: provider,
                 window: window,
                 windowStart: currentWindowStart,
                 windowEnd: now,
@@ -125,8 +182,12 @@ public enum UsageAggregator {
         }
     }
 
-    private static func codexRateLimitTokens(for event: UsageEvent) -> Int {
-        let uncachedInput = max(0, event.inputTokens - event.cacheReadTokens)
+    /// Tokens that plausibly count against a limit: everything except cache reads.
+    /// Codex reports cached input inside `input_tokens`; Claude reports it separately.
+    private static func rateLimitTokens(for event: UsageEvent) -> Int {
+        let uncachedInput = event.provider == .codex
+            ? max(0, event.inputTokens - event.cacheReadTokens)
+            : event.inputTokens
         let meteredTokens = uncachedInput + event.cacheWriteTokens + event.outputTokens
         return meteredTokens > 0 ? meteredTokens : event.totalTokens
     }

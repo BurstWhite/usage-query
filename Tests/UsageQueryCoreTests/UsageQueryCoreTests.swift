@@ -14,6 +14,12 @@ struct UsageQueryCoreTestRunner {
         try tests.aggregationSummarizesProviderUsage()
         try tests.aggregationInfersCodexRollingLimits()
         try tests.aggregationIgnoresExpiredCodexRateLimitSnapshots()
+        try tests.claudeBridgeRecordsOnlyLimitNumbers()
+        try tests.claudeBridgeKeepsWindowsMissingFromLaterPayloads()
+        try tests.claudeBridgeIgnoresStalePayloadsFromIdleSessions()
+        try tests.aggregationInfersClaudeLimitsFromBridgeSnapshot()
+        try tests.aggregationNeverReportsMoreRemainingThanTheProvider()
+        try tests.aggregationReportsClaudeWindowUsageWithoutSnapshot()
         print("UsageQueryCoreTests passed")
     }
 }
@@ -92,8 +98,14 @@ struct UsageQueryCoreTests {
             resetAt: Date(timeIntervalSince1970: 5_000), resetAfterSeconds: 4_000,
             allowed: true, limitReached: false, planType: "plus"
         )
-        try cache.replaceRateLimitSnapshots([snapshot])
-        try expect(try cache.loadRateLimitSnapshots() == [snapshot], "expected snapshot round trip")
+        let claudeSnapshot = CodexRateLimitSnapshot(
+            provider: .claude, window: .fiveHours, observedAt: Date(timeIntervalSince1970: 1_000), usedPercent: 40,
+            resetAt: Date(timeIntervalSince1970: 5_000), resetAfterSeconds: 4_000,
+            allowed: true, limitReached: false, planType: nil
+        )
+        try cache.replaceRateLimitSnapshots([snapshot, claudeSnapshot])
+        let loaded = try cache.loadRateLimitSnapshots()
+        try expect(loaded.count == 2 && loaded.contains(snapshot) && loaded.contains(claudeSnapshot), "expected snapshot round trip per provider")
     }
 
     func codexParserReadsSessionTokenCounts() throws {
@@ -215,7 +227,7 @@ struct UsageQueryCoreTests {
 
         let summary = UsageAggregator.summarize(
             events: events,
-            codexRateLimitSnapshots: snapshots,
+            rateLimitSnapshots: snapshots,
             period: .today,
             now: now,
             calendar: Calendar(identifier: .gregorian)
@@ -259,7 +271,7 @@ struct UsageQueryCoreTests {
 
         let summary = UsageAggregator.summarize(
             events: events,
-            codexRateLimitSnapshots: snapshots,
+            rateLimitSnapshots: snapshots,
             period: .today,
             now: now,
             calendar: Calendar(identifier: .gregorian)
@@ -271,6 +283,162 @@ struct UsageQueryCoreTests {
         try expect(fiveHours.remainingTokens == nil, "expected no remaining tokens from expired snapshot")
     }
 
+    func claudeBridgeRecordsOnlyLimitNumbers() throws {
+        let home = try temporaryHome()
+        let observedAt = Date(timeIntervalSince1970: 1_782_364_800)
+        let payload = """
+        {"session_id":"SECRET_SESSION","transcript_path":"/Users/someone/SECRET_PATH/t.jsonl","cwd":"/Users/someone/SECRET_PATH","model":{"id":"claude-fable-5-2","display_name":"SECRET_MODEL"},"rate_limits":{"five_hour":{"used_percentage":41.6,"resets_at":1782372000},"seven_day":{"used_percentage":18,"resets_at":1782800000}}}
+        """
+        try ClaudeRateLimitBridge.record(statusLineJSON: Data(payload.utf8), observedAt: observedAt, homeDirectory: home)
+
+        let stored = try String(contentsOf: ClaudeRateLimitBridge.fileURL(homeDirectory: home), encoding: .utf8)
+        try expect(!stored.contains("SECRET"), "bridge persisted status line fields beyond limit numbers")
+
+        let snapshots = try ClaudeUsageProvider(homeDirectory: home).scanRateLimitSnapshots(since: nil)
+        let fiveHours = try require(snapshots.first { $0.window == .fiveHours }, "missing Claude 5h snapshot")
+        let sevenDays = try require(snapshots.first { $0.window == .sevenDays }, "missing Claude 7 days snapshot")
+        try expect(fiveHours.provider == .claude && sevenDays.provider == .claude, "expected Claude snapshots")
+        try expect(fiveHours.usedPercent == 42, "expected rounded 5h used percent")
+        try expect(fiveHours.resetAt == Date(timeIntervalSince1970: 1_782_372_000), "expected 5h reset from epoch seconds")
+        try expect(fiveHours.observedAt == observedAt, "expected observation time")
+        try expect(sevenDays.usedPercent == 18, "expected 7 days used percent")
+        try expect(ClaudeRateLimitBridge.statusLineText(for: snapshots) == "5h 42% · 7d 18%", "expected status line text")
+
+        let empty = try temporaryHome()
+        try expect(try ClaudeUsageProvider(homeDirectory: empty).scanRateLimitSnapshots(since: nil).isEmpty, "expected no snapshots without bridge file")
+    }
+
+    func claudeBridgeKeepsWindowsMissingFromLaterPayloads() throws {
+        let home = try temporaryHome()
+        let first = Date(timeIntervalSince1970: 1_782_364_800)
+        let full = #"{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1782372000},"seven_day":{"used_percentage":18,"resets_at":1782800000}}}"#
+        let partial = #"{"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1782372000}}}"#
+        try ClaudeRateLimitBridge.record(statusLineJSON: Data(full.utf8), observedAt: first, homeDirectory: home)
+        try ClaudeRateLimitBridge.record(statusLineJSON: Data(partial.utf8), observedAt: first.addingTimeInterval(60), homeDirectory: home)
+        // API-key sessions carry no rate_limits and must not wipe the file.
+        try ClaudeRateLimitBridge.record(statusLineJSON: Data(#"{"cwd":"/tmp"}"#.utf8), observedAt: first.addingTimeInterval(120), homeDirectory: home)
+
+        let snapshots = ClaudeRateLimitBridge.loadSnapshots(homeDirectory: home)
+        try expect(snapshots.first { $0.window == .fiveHours }?.usedPercent == 12, "expected newer 5h value")
+        try expect(snapshots.first { $0.window == .fiveHours }?.observedAt == first.addingTimeInterval(60), "expected newer 5h observation time")
+        let sevenDays = try require(snapshots.first { $0.window == .sevenDays }, "7 days window was dropped")
+        try expect(sevenDays.usedPercent == 18 && sevenDays.observedAt == first, "expected earlier 7 days value kept")
+    }
+
+    func claudeBridgeIgnoresStalePayloadsFromIdleSessions() throws {
+        let home = try temporaryHome()
+        let now = Date(timeIntervalSince1970: 1_782_364_800)
+        func payload(_ percent: Int, resetsIn seconds: Int) -> Data {
+            Data(#"{"rate_limits":{"five_hour":{"used_percentage":\#(percent),"resets_at":\#(1_782_364_800 + seconds)}}}"#.utf8)
+        }
+        func stored() -> CodexRateLimitSnapshot? {
+            ClaudeRateLimitBridge.loadSnapshots(homeDirectory: home).first { $0.window == .fiveHours }
+        }
+
+        try ClaudeRateLimitBridge.record(statusLineJSON: payload(60, resetsIn: 3_600), observedAt: now, homeDirectory: home)
+        // Another session still holding an earlier, lower reading of the same block.
+        try ClaudeRateLimitBridge.record(statusLineJSON: payload(20, resetsIn: 3_600), observedAt: now.addingTimeInterval(10), homeDirectory: home)
+        try expect(stored()?.usedPercent == 60 && stored()?.observedAt == now, "lower reading of the same block replaced a newer one")
+        // A session that last heard from the API before the previous reset.
+        try ClaudeRateLimitBridge.record(statusLineJSON: payload(95, resetsIn: -600), observedAt: now.addingTimeInterval(20), homeDirectory: home)
+        try expect(stored()?.usedPercent == 60, "expired block replaced the current one")
+        // Same block, later reading.
+        try ClaudeRateLimitBridge.record(statusLineJSON: payload(61, resetsIn: 3_630), observedAt: now.addingTimeInterval(30), homeDirectory: home)
+        try expect(stored()?.usedPercent == 61, "expected newer reading of the same block")
+        // After the reset a new block starts low again.
+        try ClaudeRateLimitBridge.record(statusLineJSON: payload(3, resetsIn: 3_600 + 18_000), observedAt: now.addingTimeInterval(4_000), homeDirectory: home)
+        try expect(stored()?.usedPercent == 3, "expected the next block to replace the finished one")
+    }
+
+    func aggregationNeverReportsMoreRemainingThanTheProvider() throws {
+        let now = Date(timeIntervalSince1970: 1_782_364_800)
+        let event = UsageEvent(
+            provider: .claude, source: .localUsageLog, timestamp: now.addingTimeInterval(-1_800),
+            sessionId: "s", requestId: "r", model: "claude",
+            inputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0,
+            confidence: .authoritative
+        )
+        // 70% reported account-wide, but local logs only explain part of it once the limit is inferred
+        // from an older, smaller share: remaining must follow the reported number.
+        let limit = CodexLimitSummary(
+            provider: .claude, window: .fiveHours, windowStart: now.addingTimeInterval(-18_000), windowEnd: now,
+            usedTokens: 100, inferredLimitTokens: 250, remainingTokens: 150, usedPercent: 70,
+            observedAt: now, resetAt: now.addingTimeInterval(600), limitReached: false
+        )
+        try expect(limit.remainingPercent == 30, "remaining must not exceed what the provider reported")
+
+        let unknown = UsageAggregator.limitSummaries(
+            provider: .claude, events: [event],
+            snapshots: [CodexRateLimitSnapshot(
+                provider: .claude, window: .fiveHours, observedAt: now, usedPercent: 0,
+                resetAt: now.addingTimeInterval(600), resetAfterSeconds: 600, allowed: true, limitReached: false, planType: nil
+            )],
+            now: now
+        ).first { $0.window == .fiveHours }
+        try expect(unknown?.remainingPercent == 100 && unknown?.inferredLimitTokens == nil, "expected reported 0% used without an inferred limit")
+    }
+
+    func aggregationInfersClaudeLimitsFromBridgeSnapshot() throws {
+        let now = Date(timeIntervalSince1970: 1_782_364_800)
+        func claudeEvent(_ id: String, offset: TimeInterval, output: Int) -> UsageEvent {
+            UsageEvent(
+                provider: .claude, source: .localUsageLog, timestamp: now.addingTimeInterval(offset),
+                sessionId: "s", requestId: id, model: "claude",
+                inputTokens: 100, cacheReadTokens: 5_000, cacheWriteTokens: 50, outputTokens: output,
+                confidence: .authoritative
+            )
+        }
+        let resetAt = now.addingTimeInterval(3_600)
+        let events = [
+            // Inside the rolling 5h but before the fixed block that ends at resetAt.
+            claudeEvent("before-block", offset: -4.5 * 3_600, output: 9_000),
+            claudeEvent("observed", offset: -1_800, output: 50),
+            claudeEvent("after-snapshot", offset: -60, output: 50)
+        ]
+        let snapshots = [
+            CodexRateLimitSnapshot(
+                provider: .claude, window: .fiveHours, observedAt: now.addingTimeInterval(-600), usedPercent: 20,
+                resetAt: resetAt, resetAfterSeconds: 4_200, allowed: true, limitReached: false, planType: nil
+            ),
+            CodexRateLimitSnapshot(
+                provider: .codex, window: .sevenDays, observedAt: now.addingTimeInterval(-600), usedPercent: 90,
+                resetAt: resetAt, resetAfterSeconds: 4_200, allowed: true, limitReached: false, planType: "plus"
+            )
+        ]
+
+        let summary = UsageAggregator.summarize(
+            events: events, rateLimitSnapshots: snapshots, period: .today,
+            now: now, calendar: Calendar(identifier: .gregorian)
+        )
+
+        let fiveHours = try require(summary.claudeRateLimits.first { $0.window == .fiveHours }, "missing Claude 5h summary")
+        try expect(fiveHours.windowStart == resetAt.addingTimeInterval(-5 * 3_600), "expected window anchored on reset")
+        try expect(fiveHours.usedTokens == 400, "expected metered tokens without cache reads, inside the block only")
+        try expect(fiveHours.inferredLimitTokens == 1_000, "expected limit inferred from usage at observation")
+        try expect(fiveHours.remainingTokens == 600, "expected inferred remaining tokens")
+        try expect(fiveHours.remainingPercent == 60, "expected remaining percent to include usage after the snapshot")
+
+        let sevenDays = try require(summary.claudeRateLimits.first { $0.window == .sevenDays }, "missing Claude 7 days summary")
+        try expect(sevenDays.usedPercent == nil, "Codex snapshots must not feed Claude limits")
+        try expect(summary.codexRateLimits.first { $0.window == .fiveHours }?.usedPercent == nil, "Claude snapshots must not feed Codex limits")
+    }
+
+    func aggregationReportsClaudeWindowUsageWithoutSnapshot() throws {
+        let now = Date(timeIntervalSince1970: 1_782_364_800)
+        let events = [-3_600.0, -6 * 3_600.0].enumerated().map { index, offset in
+            UsageEvent(
+                provider: .claude, source: .localUsageLog, timestamp: now.addingTimeInterval(offset),
+                sessionId: "s", requestId: "r\(index)", model: "claude",
+                inputTokens: 10, cacheReadTokens: 1_000, cacheWriteTokens: 20, outputTokens: 30,
+                confidence: .authoritative
+            )
+        }
+        let limits = UsageAggregator.limitSummaries(provider: .claude, events: events, now: now)
+        let fiveHours = try require(limits.first { $0.window == .fiveHours }, "missing Claude 5h summary")
+        let sevenDays = try require(limits.first { $0.window == .sevenDays }, "missing Claude 7 days summary")
+        try expect(fiveHours.usedTokens == 60 && sevenDays.usedTokens == 120, "expected rolling window usage")
+        try expect(fiveHours.remainingPercent == nil && fiveHours.inferredLimitTokens == nil, "expected unknown remaining without snapshot")
+    }
 
     private func temporaryHome() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

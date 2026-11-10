@@ -241,8 +241,11 @@ public enum CodexRateLimitWindow: String, Codable, CaseIterable, Identifiable, S
 }
 
 public struct CodexRateLimitSnapshot: Codable, Equatable, Identifiable, Sendable {
-    public var id: String { "\(window.rawValue)|\(Int(observedAt.timeIntervalSince1970))|\(usedPercent)" }
+    public var id: String { "\(provider.rawValue)|\(window.rawValue)|\(Int(observedAt.timeIntervalSince1970))|\(usedPercent)" }
 
+    /// Which agent reported this snapshot. The type keeps its Codex name for
+    /// history; Claude snapshots come from the status line bridge.
+    public let provider: UsageProviderKind
     public let window: CodexRateLimitWindow
     public let observedAt: Date
     public let usedPercent: Int
@@ -253,6 +256,7 @@ public struct CodexRateLimitSnapshot: Codable, Equatable, Identifiable, Sendable
     public let planType: String?
 
     public init(
+        provider: UsageProviderKind = .codex,
         window: CodexRateLimitWindow,
         observedAt: Date,
         usedPercent: Int,
@@ -262,6 +266,7 @@ public struct CodexRateLimitSnapshot: Codable, Equatable, Identifiable, Sendable
         limitReached: Bool,
         planType: String?
     ) {
+        self.provider = provider
         self.window = window
         self.observedAt = observedAt
         self.usedPercent = usedPercent

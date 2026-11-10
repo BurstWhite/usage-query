@@ -50,7 +50,7 @@ UsageProvider implementations
   -> UsageDashboardView
 ```
 
-`UsageProvider` in `Models.swift` is the central provider abstraction. Providers expose local usage events through `scanLocal(since:)`, health through `healthCheck()`, and optional Codex rate-limit metadata through `scanRateLimitSnapshots(since:)`.
+`UsageProvider` in `Models.swift` is the central provider abstraction. Providers expose local usage events through `scanLocal(since:)`, health through `healthCheck()`, and optional 5h / 7 days rate-limit metadata through `scanRateLimitSnapshots(since:)`. `CodexRateLimitSnapshot` and `CodexLimitSummary` keep their Codex names but carry a `provider` and are used for Claude too.
 
 ## Provider Rules
 
@@ -70,12 +70,16 @@ Claude Code:
 - Prefer `message.usage.*` fields and mark those events `authoritative`.
 - Only use `TokenEstimator` on `message.content` when usage fields are absent, and mark those events `estimated`.
 - Stream JSONL line by line; do not load large conversation files into memory wholesale.
+- Claude Code does not write 5h / 7 days limit state to session JSONL. The only local source is the `rate_limits` field of the status line payload. `UsageQuery --statusline-bridge [-- <existing command>]` (see `StatusLineBridgeCommand`) is meant to be configured as Claude Code's `statusLine` command; it hands stdin to `ClaudeRateLimitBridge`, which stores the latest `used_percentage` / `resets_at` per window in `~/Library/Application Support/UsageQuery/claude-rate-limits.json`.
+- `ClaudeUsageProvider.scanRateLimitSnapshots` reads that file. Do not read Claude Code's OAuth credentials or call Anthropic usage endpoints.
+- Without a snapshot, Claude limit cards show local token usage for the rolling window and `no rate snapshot`.
 
 ## Privacy Requirements
 
 Conversation text is sensitive.
 
 - Do not persist prompt text, response text, tool input, tool output, `instructions`, raw websocket bodies, or raw session JSONL lines.
+- The status line bridge may persist only limit percentages, reset times, and observation times; never the rest of the status line payload.
 - `ConversationRecord` is an in-memory-only temporary shape for fallback token estimation.
 - `UsageCache` may store numeric token counts and metadata only: provider, source, timestamps, session/request IDs, model, token counts, cost estimate, and confidence.
 - Tests should include privacy assertions when changing cache or parser behavior.
@@ -87,6 +91,7 @@ Conversation text is sensitive.
 - Period summaries filter `UsageEvent` by the selected UI period.
 - Provider summaries include total/input/output/cache tokens, model breakdown, and authoritative vs estimated counts.
 - Codex 5h and 7 days limit cards are inferred from the latest non-expired `CodexRateLimitSnapshot` plus locally observed metered token usage in that same rolling window.
+- Claude 5h and 7 days limit cards use the same inference via `limitSummaries(provider:)`, except that the window is the fixed block ending at the snapshot's `resetAt`, and metered tokens are input + cache write + output (Claude reports cache reads separately from input).
 - Manual budgets are fallback UI hints for older daily/weekly estimated quota cards; do not use manual values for Codex 5h/7d when rate-limit snapshots exist.
 
 ## UI Rules
@@ -97,6 +102,11 @@ Conversation text is sensitive.
 - Use tabs for Overview, Codex, Claude, and Settings.
 - Show whether data is authoritative or estimated.
 - Surface unavailable data clearly, for example `no rate snapshot` or `remaining unknown`.
+- The floating window (`FloatingPanelController`, `FloatingUsageView`) is a non-activating always-on-top `NSPanel` toggled from the header or Settings; keep it to the 5h / 7 days meters per provider.
+- `UsageViewModel.startAutoRefresh()` rescans every 60 seconds while the floating window is open and every 5 minutes otherwise.
+- To look at the UI without clicking through the menu bar, run `UsageQuery --render-snapshots <dir>`: it scans once and writes PNGs of every tab and the floating window in light and dark (`SnapshotCommand`). The images show real local token counts, so keep them out of the repo.
+- Limit meters only draw a bar when a limit is known; otherwise show the local token count and `limit unknown`.
+- The period picker belongs to the token cards; limit meters do not depend on it.
 - Keep expensive scanning off the main actor; use `Task.detached` as in `UsageViewModel`.
 
 ## Test Guidance

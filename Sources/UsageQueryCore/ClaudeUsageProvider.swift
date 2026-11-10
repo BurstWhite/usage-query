@@ -53,6 +53,13 @@ public struct ClaudeUsageProvider: UsageProvider {
         return order.compactMap { merged[$0] }
     }
 
+    /// Claude Code does not log limit state in session files; the only local
+    /// source is the status line bridge file (see `ClaudeRateLimitBridge`).
+    public func scanRateLimitSnapshots(since: Date?) throws -> [CodexRateLimitSnapshot] {
+        ClaudeRateLimitBridge.loadSnapshots(homeDirectory: homeDirectory)
+            .filter { snapshot in since.map { snapshot.observedAt >= $0 } ?? true }
+    }
+
     public func estimateFromConversation(_ record: ConversationRecord) -> UsageEvent? {
         let tokens = estimator.estimateTextTokens(record.contentText, provider: .claude)
         guard tokens > 0 else {
